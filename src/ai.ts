@@ -1,6 +1,6 @@
 // AI service adapter (OpenAI-compatible, strict contract)
 import axios from 'axios';
-import { AIResponse, Rule } from './types';
+import { AIResponse, Rule } from './types.js';
 
 export async function evaluateWithAI(diff: string, context: any, rules: Rule[]): Promise<AIResponse> {
   // TODO: Implement prompt construction and call to AI provider

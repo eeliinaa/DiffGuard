@@ -1,5 +1,5 @@
 // Output rendering and safety gates
-import { AIResponse } from './types';
+import { AIResponse } from './types.js';
 
 export function renderConsoleOutput(response: AIResponse) {
   console.log('Summary:', response.summary);

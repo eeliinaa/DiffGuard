@@ -1,16 +1,24 @@
 #!/usr/bin/env node
+
 import minimist from 'minimist';
-import { loadRules } from './rules';
-import { Rule } from './types';
-import { initRuleAudit } from './audit';
+import fs from 'fs';
+import yaml from 'js-yaml';
+import { Rule } from './types.js';
+import { initRuleAudit } from './audit.js';
+import * as git from './git.js';
 import path from 'path';
 
-function main() {
+async function main() {
   const argv = minimist(process.argv.slice(2));
   const rulesPath = argv['rules-path'] || path.join(process.cwd(), 'review-guidelines', 'rules.yaml');
   let rules: Rule[] = [];
   try {
-    rules = loadRules(rulesPath);
+    const file = fs.readFileSync(rulesPath, 'utf8');
+    const doc = yaml.load(file) as { rules: Rule[] };
+    if (!doc || !Array.isArray(doc.rules)) {
+      throw new Error('Invalid rules file: missing or malformed rules array');
+    }
+    rules = doc.rules.slice().sort((a, b) => a.id.localeCompare(b.id));
     console.log(`[DiffGuard] Loaded ${rules.length} rules from ${rulesPath}`);
   } catch (err) {
     console.error(`[DiffGuard] Failed to load rules:`, err);
@@ -26,11 +34,10 @@ function main() {
   else if (argv['mr']) mode = 'mr';
 
   // Placeholder: extract diff/context based on mode
-  let diffResult: string = '';
-  let normalizedDiff: any = null;
-  let fileContexts: any = null;
+  let diffResult: string | null = null;
+  let normalizedDiff = null;
+  let fileContexts = null;
   try {
-    const git = await import('./git');
     switch (mode) {
       case 'staged':
         diffResult = await git.getGitDiff();
@@ -59,5 +66,8 @@ function main() {
     process.exit(1);
   }
 }
+
+// Top-level await for ESM
+await main();
 
 main();

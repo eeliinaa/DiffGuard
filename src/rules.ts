@@ -1,6 +1,6 @@
 import fs from 'fs';
 import yaml from 'js-yaml';
-import { Rule } from './types';
+import { Rule } from './types.js';
 
 export function loadRules(rulesPath: string): Rule[] {
   const file = fs.readFileSync(rulesPath, 'utf8');

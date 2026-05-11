@@ -1,4 +1,4 @@
-import { RuleAuditEntry, Rule } from './types';
+import { RuleAuditEntry, Rule } from './types.js';
 import crypto from 'crypto';
 
 export function hashRule(rule: Rule): string {

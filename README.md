@@ -19,6 +19,7 @@ AI-powered code review CLI for GitLab, enforcing repository guidelines via AI an
    ```bash
    npm run build
    ```
+
 3. **Run CLI:**
    ```bash
    node dist/cli.js --staged
@@ -29,6 +30,8 @@ AI-powered code review CLI for GitLab, enforcing repository guidelines via AI an
    # or
    node dist/cli.js --mr <id>
    ```
+
+> **Note:** Running the CLI from `src/cli.ts` or using `ts-node` is not supported. Always build first and run from `dist/cli.js`.
 
 ## Configuration
 - **Rules file:** Place your rules in `review-guidelines/rules.yaml` (see example in repo)
