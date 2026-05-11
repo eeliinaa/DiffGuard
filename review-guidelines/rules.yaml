@@ -1,0 +1,41 @@
+- id: actions-as-string-list
+  type: ai
+  severity: warning
+  category: architecture
+  title: Send actions as string list from backend and validate in UI
+  description: >
+    Backend (C#) must send user permissions/actions as a simple string list.
+    Frontend (React) must NOT assume available actions statically, but must
+    check availability before rendering UI actions (e.g. context menu).
+
+    This ensures consistent permission handling between backend and frontend
+    and avoids UI logic duplication of authorization rules.
+
+  backend_example:
+    language: csharp
+    code: |
+      var actions = new HashSet<string>();
+
+      if (hasCondition)
+          actions.Add("edit");
+
+  frontend_example:
+    language: typescript
+    code: |
+      const contextMenu = [
+        { operLabel: "{|gcc_sl_glob_Create}", operName: "Create", faicon: "plus" }
+      ];
+
+      if (row.Actions.includes("edit")) {
+        contextMenu.push({
+          operLabel: "{|gcc_sl_edit}",
+          operName: "Edit",
+          faicon: "edit"
+        });
+      }
+
+  rule_notes:
+    - Actions must always be provided by backend as string list
+    - Frontend must never hardcode permission logic
+    - UI should only render based on provided actions array
+    - Prevent duplication of authorization logic between layers

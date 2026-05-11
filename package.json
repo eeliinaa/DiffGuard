@@ -1,0 +1,29 @@
+{
+  "name": "diffguard",
+  "version": "1.0.0",
+  "description": "AI-powered code review CLI for GitLab, enforcing repository guidelines via AI and strict rule evaluation.",
+  "main": "dist/cli.js",
+  "types": "dist/cli.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "lint": "eslint src --ext .ts",
+    "test": "echo \"No tests yet\""
+  },
+  "bin": {
+    "ai-review": "dist/cli.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "js-yaml": "^4.1.0",
+    "minimist": "^1.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/minimist": "^1.2.5",
+    "typescript": "^5.4.5",
+    "eslint": "^8.57.0"
+  }
+}
