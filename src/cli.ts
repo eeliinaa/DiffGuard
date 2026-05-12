@@ -62,7 +62,7 @@ async function main() {
     }
     console.log(`[DiffGuard] Raw diff (truncated):\n${diffResult.substring(0, 1000)}${diffResult.length > 1000 ? '\n...truncated...' : ''}`);
     normalizedDiff = git.parseUnifiedDiff(diffResult);
-    fileContexts = git.extractFileContexts(normalizedDiff, 100);
+    fileContexts = git.extractFileContexts(normalizedDiff);
     console.log(`[DiffGuard] Normalized diff:`);
     console.dir(normalizedDiff, { depth: 4 });
     console.log(`[DiffGuard] File context:`);

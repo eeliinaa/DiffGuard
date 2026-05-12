@@ -73,7 +73,9 @@ export function parseUnifiedDiff(diff: string): DiffHunk[] {
   return hunks;
 }
 
-export function extractFileContexts(hunks: DiffHunk[], contextLines = 100): FileContext[] {
+const CONTEXT_LINES = 8;
+
+export function extractFileContexts(hunks: DiffHunk[]): FileContext[] {
   const result: FileContext[] = [];
   const fileToChangedLines: Record<string, Set<number>> = {};
 
@@ -101,18 +103,82 @@ export function extractFileContexts(hunks: DiffHunk[], contextLines = 100): File
     const fileLines = fs.readFileSync(filePath, 'utf8').split('\n');
     const changedLines = Array.from(fileToChangedLines[file]).sort((a, b) => a - b);
 
+    // Build initial ranges around each changed line
+    type RangeBlock = { start: number; end: number; lines: number[] };
+    const ranges: RangeBlock[] = [];
     for (const lineNum of changedLines) {
-      const preStart = Math.max(0, lineNum - 1 - contextLines);
-      const postEnd = Math.min(fileLines.length, lineNum + contextLines);
+      const start = Math.max(0, lineNum - 1 - CONTEXT_LINES);
+      const end = Math.min(fileLines.length, lineNum + CONTEXT_LINES);
+      ranges.push({ start, end, lines: [lineNum] });
+    }
+
+    // Merge overlapping or touching ranges
+    const merged: RangeBlock[] = [];
+    for (const range of ranges) {
+      if (merged.length > 0) {
+        const last = merged[merged.length - 1];
+        if (range.start <= last.end) {
+          last.end = Math.max(last.end, range.end);
+          last.lines.push(...range.lines);
+          continue;
+        }
+      }
+      merged.push({ start: range.start, end: range.end, lines: [...range.lines] });
+    }
+
+    // Generate one FileContext per merged range
+    for (const block of merged) {
+      const sortedChanged = [...new Set(block.lines)].sort((a, b) => a - b);
+      const minChanged = sortedChanged[0];
+      const maxChanged = sortedChanged[sortedChanged.length - 1];
 
       result.push({
         file,
-        preContext: fileLines.slice(preStart, lineNum - 1),
-        postContext: fileLines.slice(lineNum, postEnd),
-        changedLines: [lineNum]
+        preContext: fileLines.slice(block.start, minChanged - 1),
+        postContext: fileLines.slice(maxChanged, block.end),
+        changedLines: sortedChanged
       });
     }
   }
 
-  return result;
+  const aggregated = new Map<string, FileContext>();
+
+  for (const ctx of result) {
+    if (!aggregated.has(ctx.file)) {
+      aggregated.set(ctx.file, {
+        file: ctx.file,
+        changedLines: [...ctx.changedLines],
+        preContext: [...ctx.preContext],
+        postContext: [...ctx.postContext],
+      });
+      continue;
+    }
+
+    const existing = aggregated.get(ctx.file)!;
+
+    // merge changedLines
+    existing.changedLines = Array.from(
+      new Set([...existing.changedLines, ...ctx.changedLines])
+    ).sort((a, b) => a - b);
+
+    // merge preContext (dedupe, preserve order)
+    const preSet = new Set(existing.preContext);
+    for (const line of ctx.preContext) {
+      if (!preSet.has(line)) {
+        preSet.add(line);
+        existing.preContext.push(line);
+      }
+    }
+
+    // merge postContext (dedupe, preserve order)
+    const postSet = new Set(existing.postContext);
+    for (const line of ctx.postContext) {
+      if (!postSet.has(line)) {
+        postSet.add(line);
+        existing.postContext.push(line);
+      }
+    }
+  }
+
+  return Array.from(aggregated.values());
 }
