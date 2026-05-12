@@ -6,11 +6,26 @@ import { DiffHunk, FileContext } from './types.js';
 export async function getGitDiff(arg?: string): Promise<string> {
   let cmd = '';
 
-  if (!arg) cmd = 'git diff --cached';
-  else if (arg.includes('...') || arg.includes('..')) cmd = `git diff ${arg}`;
-  else cmd = `git diff -- ${arg}`;
+  if (!arg) {
+    cmd = 'git diff --cached';
+    return execSync(cmd, { encoding: 'utf8' });
+  }
 
-  return execSync(cmd, { encoding: 'utf8' });
+  // Defensive: ensure arg is string before using .includes
+  if (typeof arg === 'string' && (arg.includes('...') || arg.includes('..'))) {
+    cmd = `git diff ${arg}`;
+    return execSync(cmd, { encoding: 'utf8' });
+  }
+
+  // File diff mode: git diff -- <file>
+  cmd = `git diff -- "${arg}"`;
+  let output = execSync(cmd, { encoding: 'utf8' });
+  if (!output.trim()) {
+    // Fallback: git diff HEAD -- <file>
+    cmd = `git diff HEAD -- "${arg}"`;
+    output = execSync(cmd, { encoding: 'utf8' });
+  }
+  return output;
 }
 
 export function parseUnifiedDiff(diff: string): DiffHunk[] {
@@ -23,6 +38,10 @@ export function parseUnifiedDiff(diff: string): DiffHunk[] {
 
   for (const line of lines) {
     if (line.startsWith('diff --git')) {
+      if (hunkLines.length && currentFile) {
+        hunks.push({ file: currentFile, oldStart, oldLines, newStart, newLines, lines: hunkLines });
+        hunkLines = [];
+      }
       const match = / b\/(.*)$/.exec(line);
       if (match) currentFile = match[1];
     }
@@ -33,12 +52,12 @@ export function parseUnifiedDiff(diff: string): DiffHunk[] {
         hunkLines = [];
       }
 
-      const m = /@@ -(\d+),(\d+) \+(\d+),(\d+) @@/.exec(line);
+      const m = /@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
       if (m) {
         oldStart = +m[1];
-        oldLines = +m[2];
+        oldLines = m[2] !== undefined ? +m[2] : 1;
         newStart = +m[3];
-        newLines = +m[4];
+        newLines = m[4] !== undefined ? +m[4] : 1;
       }
     }
 

@@ -29,9 +29,15 @@ async function main() {
 
   // Input acquisition: determine mode
   let mode: 'staged' | 'diff' | 'file' | 'mr' = 'staged';
-  if (argv['diff']) mode = 'diff';
-  else if (argv['file']) mode = 'file';
-  else if (argv['mr']) mode = 'mr';
+  if (typeof argv['diff'] === 'string' && argv['diff']) mode = 'diff';
+  else if (typeof argv['file'] === 'string' && argv['file']) mode = 'file';
+  else if (typeof argv['mr'] === 'string' && argv['mr']) mode = 'mr';
+
+  for (const flag of ['diff', 'file', 'mr'] as const) {
+    if (argv[flag] !== undefined && typeof argv[flag] !== 'string') {
+      console.warn(`[DiffGuard] Warning: --${flag} was passed without a value; falling back to staged mode.`);
+    }
+  }
 
   // Placeholder: extract diff/context based on mode
   let diffResult: string | null = null;
@@ -43,20 +49,20 @@ async function main() {
         diffResult = await git.getGitDiff();
         break;
       case 'diff':
-        diffResult = await git.getGitDiff(argv['diff']);
+        diffResult = await git.getGitDiff(typeof argv['diff'] === 'string' ? argv['diff'] : undefined);
         break;
       case 'file':
-        diffResult = await git.getGitDiff(argv['file']);
+        diffResult = await git.getGitDiff(typeof argv['file'] === 'string' ? argv['file'] : undefined);
         break;
       case 'mr':
-        diffResult = await git.getGitDiff(argv['mr']);
+        diffResult = await git.getGitDiff(typeof argv['mr'] === 'string' ? argv['mr'] : undefined);
         break;
       default:
         throw new Error('Unknown input mode');
     }
+    console.log(`[DiffGuard] Raw diff (truncated):\n${diffResult.substring(0, 1000)}${diffResult.length > 1000 ? '\n...truncated...' : ''}`);
     normalizedDiff = git.parseUnifiedDiff(diffResult);
     fileContexts = git.extractFileContexts(normalizedDiff, 100);
-    console.log(`[DiffGuard] Raw diff (truncated):\n${diffResult.substring(0, 1000)}${diffResult.length > 1000 ? '\n...truncated...' : ''}`);
     console.log(`[DiffGuard] Normalized diff:`);
     console.dir(normalizedDiff, { depth: 4 });
     console.log(`[DiffGuard] File context:`);
@@ -69,5 +75,3 @@ async function main() {
 
 // Top-level await for ESM
 await main();
-
-main();
