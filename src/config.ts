@@ -1,4 +1,4 @@
-import { DiffGuardConfig } from './types.js';
+import { DiffGuardConfig, GitLabConfig } from './types.js';
 
 export function loadConfig(): DiffGuardConfig {
   const apiKey = process.env['OPENROUTER_API_KEY'] ?? process.env['OPENAI_API_KEY'];
@@ -26,4 +26,24 @@ export function loadConfig(): DiffGuardConfig {
     maxRetries,
     timeoutMs,
   };
+}
+
+export function loadGitLabConfig(): GitLabConfig {
+  const token = process.env['GITLAB_TOKEN'];
+  const projectId = process.env['GITLAB_PROJECT_ID'];
+  const mrIidRaw = process.env['GITLAB_MR_IID'];
+
+  if (!token || !projectId || !mrIidRaw) {
+    throw new Error('GitLab config incomplete: GITLAB_TOKEN, GITLAB_PROJECT_ID, and GITLAB_MR_IID are required');
+  }
+
+  const mrIid = parseInt(mrIidRaw, 10);
+  if (isNaN(mrIid)) {
+    throw new Error('GITLAB_MR_IID is not a valid number');
+  }
+
+  const baseUrl = process.env['GITLAB_BASE_URL'] ?? 'https://gitlab.com/api/v4';
+  const failOnError = process.env['GITLAB_FAIL_ON_ERROR'] === '1';
+
+  return { token, projectId, mrIid, baseUrl, failOnError };
 }

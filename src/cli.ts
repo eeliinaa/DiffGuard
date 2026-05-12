@@ -3,12 +3,13 @@
 import minimist from 'minimist';
 import path from 'path';
 import { AIReviewResult, FileContext } from './types.js';
-import { loadConfig } from './config.js';
+import { loadConfig, loadGitLabConfig } from './config.js';
 import { loadRules } from './rules.js';
 import { initRuleAudit, updateAuditAfterEval } from './audit.js';
 import * as git from './git.js';
 import { evaluateWithAI } from './ai.js';
 import { renderConsoleAIResult, renderJSONAIResult } from './output.js';
+import { postGitLabMR } from './gitlab.js';
 
 async function main() {
   const argv = minimist(process.argv.slice(2));
@@ -16,6 +17,7 @@ async function main() {
   // Flags
   const outputMode: 'console' | 'json' = argv['output'] === 'json' ? 'json' : 'console';
   const dryRun = !!argv['dry-run'];
+  const gitlabEnabled = !!argv['gitlab'];
 
   // Fail fast at startup if API key is missing — skip in dry-run mode
   const config = dryRun ? null : loadConfig();
@@ -103,6 +105,23 @@ async function main() {
     renderJSONAIResult(result);
   } else {
     renderConsoleAIResult(result);
+  }
+
+  // GitLab MR integration — side-effect only, runs after all output
+  if (gitlabEnabled) {
+    const cliFailOnError = !!argv['gitlab-fail-on-error'];
+    let failOnError = cliFailOnError; // safe fallback if loadGitLabConfig throws
+    try {
+      const gitlabConfig = loadGitLabConfig();
+      failOnError = gitlabConfig.failOnError || cliFailOnError; // merge: env OR flag
+      await postGitLabMR(result, gitlabConfig);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[DiffGuard] GitLab error:', message);
+      if (failOnError) {
+        process.exitCode = 1;
+      }
+    }
   }
 }
 

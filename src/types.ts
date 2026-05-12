@@ -82,6 +82,15 @@ export interface AIReviewResult {
   comments: ReviewComment[];
 }
 
+/** Configuration for GitLab MR integration. */
+export interface GitLabConfig {
+  token: string;
+  projectId: string;
+  mrIid: number;
+  baseUrl: string;
+  failOnError: boolean;
+}
+
 /** Projected rule shape sent to the AI — strips verbose code examples. */
 export interface SerializedRule {
   id: string;
