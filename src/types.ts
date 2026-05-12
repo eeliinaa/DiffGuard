@@ -61,3 +61,46 @@ export interface RuleAuditEntry {
   skipReason?: string;
   timestamp: string;
 }
+
+// ---------------------------------------------------------------------------
+// AI review output contract (spec-aligned, separate from legacy AIResponse)
+// ---------------------------------------------------------------------------
+
+export type ReviewSeverity = 'low' | 'medium' | 'high';
+
+export interface ReviewComment {
+  file: string;
+  severity: ReviewSeverity;
+  lineHint: number | null;
+  message: string;
+  suggestion: string;
+  ruleId?: string;
+}
+
+export interface AIReviewResult {
+  summary: string;
+  comments: ReviewComment[];
+}
+
+/** Projected rule shape sent to the AI — strips verbose code examples. */
+export interface SerializedRule {
+  id: string;
+  title?: string;
+  description: string;
+  rule_notes?: string[];
+}
+
+/** Payload serialized into the AI user message. */
+export interface AIReviewPayload {
+  rules: SerializedRule[];
+  fileContexts: FileContext[];
+}
+
+/** Runtime configuration loaded from environment variables. */
+export interface DiffGuardConfig {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  maxRetries: number;
+  timeoutMs: number;
+}

@@ -1,3 +1,3 @@
-const a = 1;
-const b = 2;
-const c = 3;
+const b = 999;
+const c = 777;
+const d = 555;

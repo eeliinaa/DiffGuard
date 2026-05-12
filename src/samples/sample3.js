@@ -2,7 +2,7 @@ const test = `line 1
 line 2
 line 3
 line 4
-line 5
+line 5AAA
 line 6
 line 7
 line 8
@@ -77,7 +77,7 @@ line 76
 line 77
 line 78
 line 79
-line 80
+line 80AAA
 line 81
 line 82
 line 83

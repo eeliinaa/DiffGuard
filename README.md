@@ -38,9 +38,34 @@ AI-powered code review CLI for GitLab, enforcing repository guidelines via AI an
 - **GitLab Token:** Set `GITLAB_TOKEN` in your environment for MR posting
 - **AI Provider:** Configure endpoint/model via environment variables (see future docs)
 
+## Dry-Run Mode
+
+The `--dry-run` flag lets you run DiffGuard **without an OpenAI API key** and **without making any AI calls**. It is useful for:
+
+- Testing your git diff parsing and rule wiring locally
+- CI pipeline smoke tests where you don't want to spend API credits
+- Verifying the CLI works end-to-end before configuring credentials
+
+**What it does:**
+- Parses the git diff and builds file contexts normally
+- Skips the AI evaluation step entirely
+- Returns a mocked result: `{ "summary": "LGTM [dry-run]", "comments": [] }`
+
+**What it does NOT do:**
+- It does NOT call the OpenAI API
+- It does NOT require `OPENAI_API_KEY` to be set
+
+**Usage:**
+```bash
+node dist/cli.js --staged --dry-run
+node dist/cli.js --staged --dry-run --output json
+```
+
+> Without `--dry-run`, the CLI will fail immediately at startup if `OPENAI_API_KEY` is not set.
+
 ## Output Modes
 - Console (default)
-- JSON (`--json`)
+- JSON (`--output json`)
 - GitLab posting (`--gitlab`)
 
 ## CI Usage Example

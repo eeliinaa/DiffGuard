@@ -1,31 +1,41 @@
 import React, { useEffect, useState } from "react";
 
-export default function UserProfile({ userId, isAdmin, theme = "light" }) {
+export default function UserProfile({
+  userId,
+  actions = [],
+  theme = "dark",
+}) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+
+  const canEdit = actions.includes("edit");
+  const canDelete = actions.includes("delete");
 
   const getUserData = async () => {
     setLoading(true);
     setError(null);
 
     try {
-      const response = await fetch(`/api/v2/users/${userId}`);
+      const response = await fetch(`/api/v3/users/${userId}`);
 
       if (!response.ok) {
-        throw new Error("User fetch failed");
+        throw new Error("User request failed");
       }
 
       const data = await response.json();
 
-      // changed: normalize structure
       setUser({
         ...data,
         fullName: `${data.firstName} ${data.lastName}`,
+        initials: `${data.firstName?.[0] || ""}${data.lastName?.[0] || ""}`,
       });
+
+      setLastUpdated(new Date().toISOString());
     } catch (err) {
-      console.error("Failed to load user", err);
-      setError("Failed to load user data");
+      console.error("User loading failed", err);
+      setError("Unable to load user profile");
     } finally {
       setLoading(false);
     }
@@ -38,17 +48,17 @@ export default function UserProfile({ userId, isAdmin, theme = "light" }) {
   }, [userId]);
 
   const handleUpdateClick = () => {
-    if (!isAdmin) {
-      alert("Access denied: admin only action");
+    if (!canEdit) {
+      alert("Missing edit permission");
       return;
     }
 
     console.log("Updating user profile...", userId);
   };
 
-  const handleDeleteClick = () => {
-    if (!isAdmin) {
-      alert("Access denied: admin only action");
+  const handleDeleteClick = async () => {
+    if (!canDelete) {
+      alert("Missing delete permission");
       return;
     }
 
@@ -56,37 +66,57 @@ export default function UserProfile({ userId, isAdmin, theme = "light" }) {
   };
 
   if (loading) {
-    return <div className="loading">Loading user...</div>;
+    return <div className="loading-state">Loading profile...</div>;
   }
 
   if (error) {
-    return <div className="error">{error}</div>;
+    return <div className="error-state">{error}</div>;
   }
 
   if (!user) {
-    return <div>No user found</div>;
+    return <div>No user data found</div>;
   }
 
   return (
     <div className={`user-profile theme-${theme}`}>
-      <h1>{user.fullName}</h1>
+      <div className="header">
+        <div className="avatar">
+          {user.initials}
+        </div>
 
-      <p>Email: {user.email}</p>
+        <div>
+          <h1>{user.fullName}</h1>
+          <p>{user.email}</p>
+        </div>
+      </div>
+
       <p>Role: {user.role}</p>
 
-      {user.isVerified && <p className="verified">Verified user</p>}
+      {user.isVerified && (
+        <p className="verified-badge">
+          Verified account
+        </p>
+      )}
 
-      {isAdmin && (
-        <div className="actions">
+      {lastUpdated && (
+        <small>
+          Last updated: {lastUpdated}
+        </small>
+      )}
+
+      <div className="actions">
+        {canEdit && (
           <button onClick={handleUpdateClick}>
             Update User
           </button>
+        )}
 
+        {canDelete && (
           <button onClick={handleDeleteClick}>
             Delete User
           </button>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

@@ -1,31 +1,36 @@
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { DiffHunk, FileContext } from './types.js';
 
 export async function getGitDiff(arg?: string): Promise<string> {
-  let cmd = '';
-
   if (!arg) {
-    cmd = 'git diff --cached';
-    return execSync(cmd, { encoding: 'utf8' });
+    // No user-supplied input — safe to use execSync directly
+    return execSync('git diff --cached', { encoding: 'utf8' });
   }
 
-  // Defensive: ensure arg is string before using .includes
-  if (typeof arg === 'string' && (arg.includes('...') || arg.includes('..'))) {
-    cmd = `git diff ${arg}`;
-    return execSync(cmd, { encoding: 'utf8' });
+  // Branch range: git diff <ref>..<ref> or <ref>...<ref>
+  if (arg.includes('...') || arg.includes('..')) {
+    const result = spawnSync('git', ['diff', arg], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      throw new Error(`git diff failed: ${result.stderr}`);
+    }
+    return result.stdout;
   }
 
-  // File diff mode: git diff -- <file>
-  cmd = `git diff -- "${arg}"`;
-  let output = execSync(cmd, { encoding: 'utf8' });
-  if (!output.trim()) {
+  // File diff mode — use spawnSync to prevent command injection
+  let result = spawnSync('git', ['diff', '--', arg], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(`git diff failed: ${result.stderr}`);
+  }
+  if (!result.stdout.trim()) {
     // Fallback: git diff HEAD -- <file>
-    cmd = `git diff HEAD -- "${arg}"`;
-    output = execSync(cmd, { encoding: 'utf8' });
+    result = spawnSync('git', ['diff', 'HEAD', '--', arg], { encoding: 'utf8' });
+    if (result.status !== 0) {
+      throw new Error(`git diff HEAD failed: ${result.stderr}`);
+    }
   }
-  return output;
+  return result.stdout;
 }
 
 export function parseUnifiedDiff(diff: string): DiffHunk[] {

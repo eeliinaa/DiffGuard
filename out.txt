@@ -1,0 +1,13 @@
+
+Review completed with identified issues.
+
+[HIGH] src/samples/sample1.jsx:3
+  Frontend is hardcoding permission logic, violating the rule to validate actions from backend.
+  -> Refactor to fetch and validate actions from backend as a string list.
+  rule: actions-as-string-list
+
+[MEDIUM] src/samples/sample1.jsx:11
+  UI rendering logic is based on static assumptions of permissions.
+  -> Use dynamic rendering based on actions array provided by backend.
+  rule: actions-as-string-list
+

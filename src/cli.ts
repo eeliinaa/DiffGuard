@@ -1,33 +1,43 @@
 #!/usr/bin/env node
 
 import minimist from 'minimist';
-import fs from 'fs';
-import yaml from 'js-yaml';
-import { Rule } from './types.js';
-import { initRuleAudit } from './audit.js';
-import * as git from './git.js';
 import path from 'path';
+import { AIReviewResult, FileContext } from './types.js';
+import { loadConfig } from './config.js';
+import { loadRules } from './rules.js';
+import { initRuleAudit, updateAuditAfterEval } from './audit.js';
+import * as git from './git.js';
+import { evaluateWithAI } from './ai.js';
+import { renderConsoleAIResult, renderJSONAIResult } from './output.js';
 
 async function main() {
   const argv = minimist(process.argv.slice(2));
-  const rulesPath = argv['rules-path'] || path.join(process.cwd(), 'review-guidelines', 'rules.yaml');
-  let rules: Rule[] = [];
+
+  // Flags
+  const outputMode: 'console' | 'json' = argv['output'] === 'json' ? 'json' : 'console';
+  const dryRun = !!argv['dry-run'];
+
+  // Fail fast at startup if API key is missing — skip in dry-run mode
+  const config = dryRun ? null : loadConfig();
+
+  // Load rules
+  const rulesPath =
+    typeof argv['rules-path'] === 'string'
+      ? argv['rules-path']
+      : path.join(process.cwd(), 'review-guidelines', 'rules.yaml');
+
+  let rules;
   try {
-    const file = fs.readFileSync(rulesPath, 'utf8');
-    const doc = yaml.load(file) as { rules: Rule[] };
-    if (!doc || !Array.isArray(doc.rules)) {
-      throw new Error('Invalid rules file: missing or malformed rules array');
-    }
-    rules = doc.rules.slice().sort((a, b) => a.id.localeCompare(b.id));
-    console.log(`[DiffGuard] Loaded ${rules.length} rules from ${rulesPath}`);
+    rules = loadRules(rulesPath);
+    console.error(`[DiffGuard] Loaded ${rules.length} rules from ${rulesPath}`);
   } catch (err) {
-    console.error(`[DiffGuard] Failed to load rules:`, err);
+    console.error('[DiffGuard] Failed to load rules:', err);
     process.exit(1);
   }
-  // Deterministic audit table initialization
+
   const auditTable = initRuleAudit(rules);
 
-  // Input acquisition: determine mode
+  // Determine input mode
   let mode: 'staged' | 'diff' | 'file' | 'mr' = 'staged';
   if (typeof argv['diff'] === 'string' && argv['diff']) mode = 'diff';
   else if (typeof argv['file'] === 'string' && argv['file']) mode = 'file';
@@ -35,14 +45,14 @@ async function main() {
 
   for (const flag of ['diff', 'file', 'mr'] as const) {
     if (argv[flag] !== undefined && typeof argv[flag] !== 'string') {
-      console.warn(`[DiffGuard] Warning: --${flag} was passed without a value; falling back to staged mode.`);
+      console.error(`[DiffGuard] Warning: --${flag} was passed without a value; falling back to staged mode.`);
     }
   }
 
-  // Placeholder: extract diff/context based on mode
-  let diffResult: string | null = null;
-  let normalizedDiff = null;
-  let fileContexts = null;
+  // Extract diff and build file contexts
+  let diffResult = '';
+  let fileContexts: FileContext[] = [];
+
   try {
     switch (mode) {
       case 'staged':
@@ -60,18 +70,42 @@ async function main() {
       default:
         throw new Error('Unknown input mode');
     }
-    console.log(`[DiffGuard] Raw diff (truncated):\n${diffResult.substring(0, 1000)}${diffResult.length > 1000 ? '\n...truncated...' : ''}`);
-    normalizedDiff = git.parseUnifiedDiff(diffResult);
+
+    // Empty diff — short-circuit before any API call
+    if (!diffResult.trim()) {
+      console.error('[DiffGuard] No diff found. Nothing to review.');
+      const lgtm: AIReviewResult = { summary: 'LGTM', comments: [] };
+      outputMode === 'json' ? renderJSONAIResult(lgtm) : renderConsoleAIResult(lgtm);
+      return;
+    }
+
+    const normalizedDiff = git.parseUnifiedDiff(diffResult);
     fileContexts = git.extractFileContexts(normalizedDiff);
-    console.log(`[DiffGuard] Normalized diff:`);
-    console.dir(normalizedDiff, { depth: 4 });
-    console.log(`[DiffGuard] File context:`);
-    console.dir(fileContexts, { depth: 4 });
+    console.error(`[DiffGuard] Extracted ${fileContexts.length} file context(s)`);
   } catch (err) {
-    console.error(`[DiffGuard] Failed to extract diff/context:`, err);
+    console.error('[DiffGuard] Failed to extract diff/context:', err);
     process.exit(1);
+  }
+
+  // Dry-run: skip AI call, confirm wiring is correct
+  if (dryRun) {
+    console.error('[DiffGuard] Dry-run mode — skipping AI call.');
+    const dryResult: AIReviewResult = { summary: 'LGTM [dry-run]', comments: [] };
+    outputMode === 'json' ? renderJSONAIResult(dryResult) : renderConsoleAIResult(dryResult);
+    return;
+  }
+
+  // AI evaluation
+  const result = await evaluateWithAI(fileContexts, rules, config!);
+  updateAuditAfterEval(auditTable, result);
+
+  if (outputMode === 'json') {
+    renderJSONAIResult(result);
+  } else {
+    renderConsoleAIResult(result);
   }
 }
 
 // Top-level await for ESM
 await main();
+
