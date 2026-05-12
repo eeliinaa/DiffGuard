@@ -2,14 +2,28 @@
 
 import minimist from 'minimist';
 import path from 'path';
-import { AIReviewResult, FileContext } from './types.js';
+import {
+  AIReviewResult,
+  FileContext,
+  GitLabConfig,
+  GitLabMRVersion,
+  ResolvedPositionProvider,
+} from './types.js';
 import { loadConfig, loadGitLabConfig } from './config.js';
 import { loadRules } from './rules.js';
 import { initRuleAudit, updateAuditAfterEval } from './audit.js';
 import * as git from './git.js';
 import { evaluateWithAI } from './ai.js';
 import { renderConsoleAIResult, renderJSONAIResult } from './output.js';
-import { postGitLabMR } from './gitlab.js';
+import {
+  fetchExistingDiscussionKeys,
+  fetchExistingNoteHashes,
+  fetchMRVersion,
+  getMergeRequestFileContexts,
+  LocalPositionProvider,
+  MRPositionProvider,
+  postGitLabMR,
+} from './gitlab.js';
 
 async function main() {
   const argv = minimist(process.argv.slice(2));
@@ -43,13 +57,18 @@ async function main() {
   let mode: 'staged' | 'diff' | 'file' | 'mr' = 'staged';
   if (typeof argv['diff'] === 'string' && argv['diff']) mode = 'diff';
   else if (typeof argv['file'] === 'string' && argv['file']) mode = 'file';
-  else if (typeof argv['mr'] === 'string' && argv['mr']) mode = 'mr';
+  else if (argv['mr']) mode = 'mr'; // boolean flag — MR identity comes from env vars
 
-  for (const flag of ['diff', 'file', 'mr'] as const) {
+  for (const flag of ['diff', 'file'] as const) {
     if (argv[flag] !== undefined && typeof argv[flag] !== 'string') {
       console.error(`[DiffGuard] Warning: --${flag} was passed without a value; falling back to staged mode.`);
     }
   }
+
+  // Hoisted across switch and posting block
+  let gitlabConfig: GitLabConfig | null = null;
+  let positionProvider: ResolvedPositionProvider | null = null;
+  let mrVersion: GitLabMRVersion | null = null;
 
   // Extract diff and build file contexts
   let diffResult = '';
@@ -66,27 +85,47 @@ async function main() {
       case 'file':
         diffResult = await git.getGitDiff(typeof argv['file'] === 'string' ? argv['file'] : undefined);
         break;
-      case 'mr':
-        diffResult = await git.getGitDiff(typeof argv['mr'] === 'string' ? argv['mr'] : undefined);
+      case 'mr': {
+        // MR mode: fetch diff entirely from GitLab API — no local git state used
+        try {
+          gitlabConfig = loadGitLabConfig();
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[DiffGuard] ${msg}`);
+          process.exit(1);
+        }
+        console.error('[DiffGuard] Using GitLab base URL:', gitlabConfig!.baseUrl);
+        mrVersion = await fetchMRVersion(gitlabConfig!);
+        const mrResult = await getMergeRequestFileContexts(gitlabConfig!);
+        fileContexts = mrResult.fileContexts;
+        positionProvider = new MRPositionProvider(mrResult.positionMap);
         break;
+      }
       default:
         throw new Error('Unknown input mode');
     }
 
-    // Empty diff — short-circuit before any API call
-    if (!diffResult.trim()) {
-      console.error('[DiffGuard] No diff found. Nothing to review.');
-      const lgtm: AIReviewResult = { summary: 'LGTM', comments: [] };
-      outputMode === 'json' ? renderJSONAIResult(lgtm) : renderConsoleAIResult(lgtm);
-      return;
-    }
+    if (mode !== 'mr') {
+      // Empty diff — short-circuit before any API call
+      if (!diffResult.trim()) {
+        console.error('[DiffGuard] No diff found. Nothing to review.');
+        const lgtm: AIReviewResult = { summary: 'LGTM', comments: [] };
+        outputMode === 'json' ? renderJSONAIResult(lgtm) : renderConsoleAIResult(lgtm);
+        return;
+      }
 
-    const normalizedDiff = git.parseUnifiedDiff(diffResult);
-    fileContexts = git.extractFileContexts(normalizedDiff);
-    console.error(`[DiffGuard] Extracted ${fileContexts.length} file context(s)`);
+      const normalizedDiff = git.parseUnifiedDiff(diffResult);
+      fileContexts = git.extractFileContexts(normalizedDiff);
+      console.error(`[DiffGuard] Extracted ${fileContexts.length} file context(s)`);
+    }
   } catch (err) {
     console.error('[DiffGuard] Failed to extract diff/context:', err);
     process.exit(1);
+  }
+
+  // Set position provider for local modes (after fileContexts is populated)
+  if (mode !== 'mr') {
+    positionProvider = new LocalPositionProvider(fileContexts);
   }
 
   // Dry-run: skip AI call, confirm wiring is correct
@@ -112,9 +151,15 @@ async function main() {
     const cliFailOnError = !!argv['gitlab-fail-on-error'];
     let failOnError = cliFailOnError; // safe fallback if loadGitLabConfig throws
     try {
-      const gitlabConfig = loadGitLabConfig();
-      failOnError = gitlabConfig.failOnError || cliFailOnError; // merge: env OR flag
-      await postGitLabMR(result, gitlabConfig);
+      const resolvedConfig = gitlabConfig ?? loadGitLabConfig();
+      failOnError = resolvedConfig.failOnError || cliFailOnError; // merge: env OR flag
+      // Version: already fetched for MR mode; explicitly fetched for local modes
+      const version = mode === 'mr' ? mrVersion! : await fetchMRVersion(resolvedConfig);
+      const existingState = mode === 'mr' ? {
+        discussionKeys: await fetchExistingDiscussionKeys(resolvedConfig),
+        noteHashes: await fetchExistingNoteHashes(resolvedConfig),
+      } : undefined;
+      await postGitLabMR(result, resolvedConfig, positionProvider!, version, existingState);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error('[DiffGuard] GitLab error:', message);

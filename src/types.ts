@@ -29,6 +29,7 @@ export interface FileContext {
   preContext: string[];
   postContext: string[];
   changedLines: number[];
+  contextType?: 'changed' | 'deleted';
 }
 
 export interface AIRuleFinding {
@@ -89,6 +90,51 @@ export interface GitLabConfig {
   mrIid: number;
   baseUrl: string;
   failOnError: boolean;
+}
+
+/** Diff version metadata returned by the GitLab MR versions API. */
+export interface GitLabMRVersion {
+  base_sha: string;
+  start_sha: string;
+  head_sha: string;
+}
+
+/** Position payload for a GitLab inline discussion on a text diff. */
+export interface GitLabInlinePosition {
+  position_type: 'text';
+  base_sha: string;
+  start_sha: string;
+  head_sha: string;
+  new_path: string;
+  new_line: number;
+}
+
+/** Minimal position data for a single changed line from a GitLab MR diff. */
+export interface GitLabDiffPosition {
+  new_line: number;
+  new_path: string;
+}
+
+/** Map from file path to its list of changed-line positions from the MR diff. */
+export type MRPositionMap = Map<string, GitLabDiffPosition[]>;
+
+/** Combined result of fetching MR diff data from GitLab: contexts and position map. */
+export interface MRDiffResult {
+  fileContexts: FileContext[];
+  positionMap: MRPositionMap;
+}
+
+/** Runtime context passed to ResolvedPositionProvider.resolve — always contains version SHAs. */
+export type ResolveContext = {
+  version: GitLabMRVersion;
+};
+
+/** Pluggable strategy for resolving a ReviewComment to a GitLab inline position. */
+export interface ResolvedPositionProvider {
+  resolve(
+    comment: ReviewComment,
+    context: ResolveContext,
+  ): { position: GitLabInlinePosition; snappedLine: number } | null;
 }
 
 /** Projected rule shape sent to the AI — strips verbose code examples. */

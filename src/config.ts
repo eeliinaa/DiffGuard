@@ -42,7 +42,10 @@ export function loadGitLabConfig(): GitLabConfig {
     throw new Error('GITLAB_MR_IID is not a valid number');
   }
 
-  const baseUrl = process.env['GITLAB_BASE_URL'] ?? 'https://gitlab.com/api/v4';
+  const baseUrl = process.env['GITLAB_BASE_URL'];
+  if (!baseUrl || !baseUrl.trim()) {
+    throw new Error('[DiffGuard] GITLAB_BASE_URL is required. No safe default allowed.');
+  }
   const failOnError = process.env['GITLAB_FAIL_ON_ERROR'] === '1';
 
   return { token, projectId, mrIid, baseUrl, failOnError };
