@@ -29,6 +29,8 @@ AI-powered code review CLI for GitLab, enforcing repository guidelines via AI an
    node dist/cli.js --file src/example.tsx
    # or
    node dist/cli.js --mr <id>
+   # or
+   node dist/cli.js --mr --gitlab
    ```
 
 > **Note:** Running the CLI from `src/cli.ts` or using `ts-node` is not supported. Always build first and run from `dist/cli.js`.

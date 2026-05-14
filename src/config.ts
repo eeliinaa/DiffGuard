@@ -19,12 +19,26 @@ export function loadConfig(): DiffGuardConfig {
     process.exit(1);
   }
 
+  const rawConcurrency = parseInt(process.env['DIFFGUARD_MAX_CONCURRENCY'] ?? '2', 10);
+  const parsedConcurrency = isNaN(rawConcurrency) ? 2 : rawConcurrency;
+  const maxConcurrency = Math.min(Math.max(1, parsedConcurrency), 3);
+  if (parsedConcurrency !== maxConcurrency) {
+    console.error(
+      `[DiffGuard] DIFFGUARD_MAX_CONCURRENCY=${parsedConcurrency} is out of range; clamped to ${maxConcurrency} (allowed: 1–3).`,
+    );
+  }
+
+  const rawChunkSize = parseInt(process.env['DIFFGUARD_CHUNK_SIZE'] ?? '300', 10);
+  const chunkSize = isNaN(rawChunkSize) || rawChunkSize < 1 ? 300 : rawChunkSize;
+
   return {
     apiKey,
     model: process.env['DIFFGUARD_MODEL'] ?? 'openai/gpt-4o',
     baseUrl: process.env['DIFFGUARD_API_URL'] ?? 'https://openrouter.ai/api/v1',
     maxRetries,
     timeoutMs,
+    maxConcurrency,
+    chunkSize,
   };
 }
 
@@ -47,6 +61,7 @@ export function loadGitLabConfig(): GitLabConfig {
     throw new Error('[DiffGuard] GITLAB_BASE_URL is required. No safe default allowed.');
   }
   const failOnError = process.env['GITLAB_FAIL_ON_ERROR'] === '1';
+  const allowInsecureHttp = process.env['DIFFGUARD_ALLOW_INSECURE_HTTP'] === 'true';
 
-  return { token, projectId, mrIid, baseUrl, failOnError };
+  return { token, projectId, mrIid, baseUrl, failOnError, allowInsecureHttp };
 }

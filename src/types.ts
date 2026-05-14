@@ -73,7 +73,12 @@ export interface ReviewComment {
   file: string;
   severity: ReviewSeverity;
   lineHint: number | null;
+  /** Exact verbatim code statement that is the subject of this finding. */
+  violatingStatement: string;
+  /** Single isolated reason why this statement violates. */
   message: string;
+  /** Local-only execution path reasoning for how the risk is reached. */
+  executionPath: string;
   suggestion: string;
   ruleId?: string;
 }
@@ -90,6 +95,7 @@ export interface GitLabConfig {
   mrIid: number;
   baseUrl: string;
   failOnError: boolean;
+  allowInsecureHttp?: boolean;
 }
 
 /** Diff version metadata returned by the GitLab MR versions API. */
@@ -97,6 +103,33 @@ export interface GitLabMRVersion {
   base_sha: string;
   start_sha: string;
   head_sha: string;
+}
+
+/**
+ * Context required by postInlineMRComment to resolve and post a positioned
+ * discussion on a GitLab MR. SHAs must come directly from the MR diff_refs.
+ */
+export interface DiffContext {
+  base_sha: string;
+  start_sha: string;
+  head_sha: string;
+  /** Raw unified diff text for the file, as returned by the GitLab /changes API. */
+  diff: string;
+}
+
+/**
+ * Issue descriptor passed to postInlineMRComment.
+ * Represents a single detected rule violation for a specific file.
+ */
+export interface InlineMRIssue {
+  /** File path in the new (head) version of the MR (new_path from /changes API). */
+  filePath: string;
+  /** Rule identifier — used as a fallback search pattern in extractLineFromDiff. */
+  ruleId: string;
+  /** Human-readable message to post as the discussion body. */
+  message: string;
+  /** Optional AI-suggested line hint (1-based). May be absent or imprecise. */
+  lineHint?: number;
 }
 
 /** Position payload for a GitLab inline discussion on a text diff. */
@@ -151,6 +184,30 @@ export interface AIReviewPayload {
   fileContexts: FileContext[];
 }
 
+// ---------------------------------------------------------------------------
+// Clustering types
+// ---------------------------------------------------------------------------
+
+/**
+ * A single comment produced by the clustering layer.
+ * Summarises one root-cause group; `mergedFrom` retains every original comment.
+ */
+export interface ClusteredComment {
+  file: string;
+  ruleId: string;
+  severity: ReviewSeverity;
+  message: string;
+  lineHint: number | null;
+  /** All original ReviewComments collapsed into this cluster. */
+  mergedFrom: ReviewComment[];
+}
+
+/** Output of the clustering pass — drop-in replacement for AIReviewResult.comments. */
+export interface ClusteringResult {
+  comments: ClusteredComment[];
+  summary: string;
+}
+
 /** Runtime configuration loaded from environment variables. */
 export interface DiffGuardConfig {
   apiKey: string;
@@ -158,4 +215,8 @@ export interface DiffGuardConfig {
   baseUrl: string;
   maxRetries: number;
   timeoutMs: number;
+  /** Max concurrent AI requests (clamped to [1, 3]). Default: 2. */
+  maxConcurrency: number;
+  /** Max changed lines per AI chunk. Default: 300. */
+  chunkSize: number;
 }

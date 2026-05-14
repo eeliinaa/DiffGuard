@@ -7,77 +7,42 @@ import {
   GitLabDiffPosition,
   GitLabInlinePosition,
   GitLabMRVersion,
+  InlineMRIssue,
   MRDiffResult,
   MRPositionMap,
   ResolveContext,
   ResolvedPositionProvider,
   ReviewComment,
 } from './types.js';
+import { buildFanOutQueue, FanOutItem, validateFanOutIntegrity } from './gitlab/fanout.js';
+import { clusterComments, clusteredToReviewComment } from './gitlab/clustering.js';
+import { validateAndRepairPosition, validateGitLabPosition } from './gitlab/positionValidator.js';
 
-const MAX_NOTE_SIZE = 1_000_000;
-const TRUNCATION_SUFFIX = '\n\n*(truncated — exceeded GitLab note size limit)*';
+const INLINE_SNAP_TOLERANCE = 3; // lines
+const POST_RATE_LIMIT_DELAY_MS = 120;
+const AXIOS_TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
+function validateGitLabBaseUrl(config: GitLabConfig): void {
+  const { baseUrl, allowInsecureHttp } = config;
+  if (baseUrl.startsWith('https://')) return;
+  const hostname = (() => {
+    try { return new URL(baseUrl).hostname; } catch { return ''; }
+  })();
+  if (
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname.startsWith('192.168.')
+  ) return;
+  if (allowInsecureHttp === true) return;
+  throw new Error(`[DiffGuard] Insecure baseUrl — HTTPS required: ${baseUrl}`);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-/** djb2 hash — deterministic 8-char hex used for body markers. */
-function djb2Hash(input: string): string {
-  let hash = 5381;
-  for (let i = 0; i < input.length; i++) {
-    hash = ((hash << 5) + hash) ^ input.charCodeAt(i);
-    hash = hash >>> 0; // keep unsigned 32-bit
-  }
-  return hash.toString(16).padStart(8, '0');
-}
-
-function truncateBody(body: string): string {
-  if (body.length <= MAX_NOTE_SIZE) {
-    return body;
-  }
-  const limit = MAX_NOTE_SIZE - TRUNCATION_SUFFIX.length;
-  const lines = body.split('\n');
-  const kept: string[] = [];
-  let length = 0;
-  for (const line of lines) {
-    // +1 for the newline that join('\n') adds between lines
-    const added = (kept.length === 0 ? 0 : 1) + line.length;
-    if (length + added > limit) break;
-    kept.push(line);
-    length += added;
-  }
-  return kept.join('\n') + TRUNCATION_SUFFIX;
-}
-
-// ---------------------------------------------------------------------------
-// Dedupe keys
-// ---------------------------------------------------------------------------
-
-/**
- * Normalized semantic key for an inline discussion.
- * Stable across minor AI wording changes (whitespace, casing).
- */
-function buildInlineDedupeKey(comment: ReviewComment, snappedLine: number): string {
-  const normalizedMessage = comment.message.toLowerCase().replace(/\s+/g, ' ').trim();
-  return `${comment.file}:${snappedLine}:${comment.ruleId ?? 'no-rule'}:${normalizedMessage}`;
-}
-
-/**
- * Stable hash over the full set of fallback comments, order-independent.
- * Used to prevent reposting identical fallback summary notes on reruns.
- */
-function buildFallbackHash(comments: ReviewComment[]): string {
-  const entries = comments
-    .map(c => {
-      const msg = c.message.toLowerCase().replace(/\s+/g, ' ').trim();
-      return `${c.file}:${c.lineHint ?? 'null'}:${c.ruleId ?? 'no-rule'}:${msg}`;
-    })
-    .sort();
-  return djb2Hash(entries.join('|'));
 }
 
 // ---------------------------------------------------------------------------
@@ -87,12 +52,22 @@ function buildFallbackHash(comments: ReviewComment[]): string {
 function formatInlineBody(comment: ReviewComment, snappedLine: number): string {
   const lines: string[] = [];
   lines.push(`[${comment.severity.toUpperCase()}]`);
+  lines.push('');
+  lines.push('Violating statement:');
+  lines.push(`\`${comment.violatingStatement}\``);
+  lines.push('');
+  lines.push('Why it violates:');
   lines.push(comment.message);
-  if (snappedLine !== comment.lineHint) {
+  if (comment.executionPath) {
+    lines.push('');
+    lines.push('Execution path:');
+    lines.push(comment.executionPath);
+  }
+  if (comment.lineHint != null && snappedLine !== comment.lineHint) {
     lines.push(`(Detected near line ${comment.lineHint}.)`);
   }
   lines.push('');
-  lines.push('Suggestion:');
+  lines.push('Fix:');
   lines.push(comment.suggestion);
   if (comment.ruleId) {
     lines.push('');
@@ -102,41 +77,12 @@ function formatInlineBody(comment: ReviewComment, snappedLine: number): string {
   return lines.join('\n');
 }
 
-function buildFallbackNoteBody(
-  comments: ReviewComment[],
-  overallSummary: string,
-  hash: string,
-): string {
-  const byFile = new Map<string, ReviewComment[]>();
-  for (const comment of comments) {
-    const existing = byFile.get(comment.file) ?? [];
-    existing.push(comment);
-    byFile.set(comment.file, existing);
-  }
-
-  const sections: string[] = [];
-  for (const [file, fileComments] of byFile) {
-    const lines = [`### ${file}`];
-    for (const c of fileComments) {
-      lines.push(`- [${c.severity}]: ${c.message}`);
-      lines.push(`  suggestion: ${c.suggestion}`);
-    }
-    sections.push(lines.join('\n'));
-  }
-
-  const body =
-    sections.length > 0
-      ? `${overallSummary}\n\n${sections.join('\n\n')}`
-      : overallSummary;
-
-  return `${body}\n\n[DiffGuard Summary Hash: ${hash}]`;
-}
-
 // ---------------------------------------------------------------------------
 // GitLab API: fetch MR diff version metadata
 // ---------------------------------------------------------------------------
 
 export async function fetchMRVersion(config: GitLabConfig): Promise<GitLabMRVersion> {
+  validateGitLabBaseUrl(config);
   const apiBase = `${config.baseUrl}/api/v4`;
   const url = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}/versions`;
   const response = await axios.get<
@@ -146,7 +92,7 @@ export async function fetchMRVersion(config: GitLabConfig): Promise<GitLabMRVers
       head_commit_sha: string;
       created_at: string;
     }>
-  >(url, { headers: { 'PRIVATE-TOKEN': config.token } });
+  >(url, { headers: { 'PRIVATE-TOKEN': config.token }, timeout: AXIOS_TIMEOUT_MS });
 
   const versions = response.data;
   if (!versions || versions.length === 0) {
@@ -175,21 +121,30 @@ export async function fetchMRVersion(config: GitLabConfig): Promise<GitLabMRVers
 // ---------------------------------------------------------------------------
 
 export async function fetchExistingDiscussionKeys(config: GitLabConfig): Promise<Set<string>> {
+  validateGitLabBaseUrl(config);
   const apiBase = `${config.baseUrl}/api/v4`;
   const keys = new Set<string>();
   try {
-    const url = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}/discussions`;
-    const response = await axios.get<Array<{ notes: Array<{ body: string }> }>>(url, {
-      headers: { 'PRIVATE-TOKEN': config.token },
-    });
+    const baseUrl = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}/discussions`;
     const marker = /\[DiffGuardKey:([^\]]+)\]/;
-    for (const discussion of response.data) {
-      for (const note of discussion.notes ?? []) {
-        const match = marker.exec(note.body);
-        if (match) {
-          keys.add(match[1]);
+    let page = 1;
+    while (true) {
+      const response = await axios.get<Array<{ notes: Array<{ body: string }> }>>(baseUrl, {
+        headers: { 'PRIVATE-TOKEN': config.token },
+        params: { per_page: 100, page },
+        timeout: AXIOS_TIMEOUT_MS,
+      });
+      const discussions = response.data;
+      for (const discussion of discussions) {
+        for (const note of discussion.notes ?? []) {
+          const match = marker.exec(note.body);
+          if (match) {
+            keys.add(match[1]);
+          }
         }
       }
+      if (discussions.length < 100) break;
+      page++;
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -205,19 +160,28 @@ export async function fetchExistingDiscussionKeys(config: GitLabConfig): Promise
 // ---------------------------------------------------------------------------
 
 export async function fetchExistingNoteHashes(config: GitLabConfig): Promise<Set<string>> {
+  validateGitLabBaseUrl(config);
   const apiBase = `${config.baseUrl}/api/v4`;
   const hashes = new Set<string>();
   try {
-    const url = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}/notes`;
-    const response = await axios.get<Array<{ body: string }>>(url, {
-      headers: { 'PRIVATE-TOKEN': config.token },
-    });
+    const baseUrl = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}/notes`;
     const marker = /\[DiffGuard Summary Hash: ([a-f0-9]+)\]/;
-    for (const note of response.data) {
-      const match = marker.exec(note.body);
-      if (match) {
-        hashes.add(match[1]);
+    let page = 1;
+    while (true) {
+      const response = await axios.get<Array<{ body: string }>>(baseUrl, {
+        headers: { 'PRIVATE-TOKEN': config.token },
+        params: { per_page: 100, page },
+        timeout: AXIOS_TIMEOUT_MS,
+      });
+      const notes = response.data;
+      for (const note of notes) {
+        const match = marker.exec(note.body);
+        if (match) {
+          hashes.add(match[1]);
+        }
       }
+      if (notes.length < 100) break;
+      page++;
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -252,7 +216,7 @@ export class LocalPositionProvider implements ResolvedPositionProvider {
 
     for (const cl of ctx.changedLines) {
       const dist = Math.abs(cl - lineHint);
-      if (dist <= 3 && dist < nearestDist) {
+      if (dist <= INLINE_SNAP_TOLERANCE && dist < nearestDist) {
         nearest = cl;
         nearestDist = dist;
       }
@@ -286,24 +250,31 @@ export class MRPositionProvider implements ResolvedPositionProvider {
     comment: ReviewComment,
     { version }: ResolveContext,
   ): { position: GitLabInlinePosition; snappedLine: number } | null {
-    if (comment.lineHint === null) return null;
-
     const positions = this.positionMap.get(comment.file);
     if (!positions || positions.length === 0) return null;
 
-    const lineHint = comment.lineHint;
     let nearest: GitLabDiffPosition | null = null;
     let nearestDist = Infinity;
 
-    for (const pos of positions) {
-      const dist = Math.abs(pos.new_line - lineHint);
-      if (dist <= 3 && dist < nearestDist) {
-        nearest = pos;
-        nearestDist = dist;
+    // ─────────────────────────────────────────────
+    // 1. PRIORITY: lineHint snapping (if available)
+    // ─────────────────────────────────────────────
+    if (comment.lineHint !== null && comment.lineHint !== undefined) {
+      for (const pos of positions) {
+        const dist = Math.abs(pos.new_line - comment.lineHint);
+        if (dist <= INLINE_SNAP_TOLERANCE && dist < nearestDist) {
+          nearest = pos;
+          nearestDist = dist;
+        }
       }
     }
 
-    if (nearest === null) return null;
+    // ─────────────────────────────────────────────
+    // 2. FALLBACK: no lineHint or no snap match → first changed line in the file
+    // ─────────────────────────────────────────────
+    if (nearest === null) {
+      nearest = positions[0];
+    }
 
     return {
       position: {
@@ -320,6 +291,19 @@ export class MRPositionProvider implements ResolvedPositionProvider {
 }
 
 // ---------------------------------------------------------------------------
+// Retry helpers
+// ---------------------------------------------------------------------------
+
+const RETRYABLE_STATUS_CODES = [429, 502, 503, 504];
+
+function isRetryable(err: unknown): boolean {
+  if (axios.isAxiosError(err) && err.response?.status !== undefined) {
+    return RETRYABLE_STATUS_CODES.includes(err.response.status);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -328,78 +312,178 @@ export async function postGitLabMR(
   config: GitLabConfig,
   provider: ResolvedPositionProvider,
   version: GitLabMRVersion,
-  existingState?: { discussionKeys: Set<string>; noteHashes: Set<string> },
+  existingState?: {
+    discussionKeys: Set<string>;
+    noteHashes?: Set<string>;
+    /** MR diff position map — required for hard-guarantee inline validation. */
+    positionMap?: MRPositionMap;
+  },
 ): Promise<void> {
-  if (result.comments.length === 0) return;
+  validateGitLabBaseUrl(config);
+
+  const totalComments = result.comments.length;
+  console.error(`[DiffGuard][FANOUT] total AI comments: ${totalComments}`);
+
+  if (totalComments === 0) return;
 
   const apiBase = `${config.baseUrl}/api/v4`;
-  const projectPath = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}`;
+  const projectPath = `${apiBase}/projects/${encodeURIComponent(
+    config.projectId,
+  )}/merge_requests/${config.mrIid}`;
 
-  const existingKeys = new Set<string>(existingState?.discussionKeys);
+  const existingKeys = new Set(existingState?.discussionKeys);
+  const positionMap = existingState?.positionMap;
 
-  const fallback: ReviewComment[] = [];
+  // ---------------------------------------------------------
+  // STEP 0: SMART CLUSTERING — group AI comments by root cause before posting
+  // Reduces GitLab noise: N raw comments → ≤N root-cause comments.
+  // ---------------------------------------------------------
+  const clusteringResult = clusterComments(result);
+  const clusteredResult: AIReviewResult = {
+    summary: clusteringResult.summary,
+    comments: clusteringResult.comments.map(clusteredToReviewComment),
+  };
+  const clusteredCount = clusteredResult.comments.length;
+  console.error(
+    `[DiffGuard][Clustering] ${totalComments} AI comment(s) → ${clusteredCount} cluster(s)`,
+  );
 
-  for (const comment of result.comments) {
-    const positioned = provider.resolve(comment, { version });
+  // ---------------------------------------------------------
+  // STEP 1: BUILD FAN-OUT QUEUE — 1 AI comment = 1 FanOutItem (integrity enforced)
+  // ---------------------------------------------------------
+  const fanoutQueue = buildFanOutQueue(clusteredResult, provider, version, existingKeys);
+  validateFanOutIntegrity(clusteredCount, fanoutQueue);
 
-    if (!positioned) {
-      fallback.push(comment);
-      continue;
+  // ---------------------------------------------------------
+  // STEP 1.5: HARD GUARANTEE — validate and repair every inline position
+  //
+  // Applies only when positionMap is available (MR mode).
+  // For each inline item:
+  //   - VALID   → keep as-is, log [Position][VALID]
+  //   - INVALID → attempt repair (snap ±2, or first changed line in file)
+  //   - Cannot repair → downgrade to global, log [Position][FALLBACK]
+  // ---------------------------------------------------------
+  if (positionMap) {
+    for (const item of fanoutQueue) {
+      if (item.type !== 'inline' || item.position === undefined) continue;
+
+      const validated = validateAndRepairPosition(item.position, positionMap);
+
+      if (validated === null) {
+        // No valid position found — downgrade to global
+        console.error(
+          `[Position][FALLBACK] converted inline → global ` +
+          `file=${item.comment.file} original_line=${item.position.new_line}`,
+        );
+        item.type = 'global';
+        item.position = undefined;
+      } else {
+        // Keep (possibly repaired) position
+        item.position = validated;
+      }
     }
 
-    const { position, snappedLine } = positioned;
-    const key = buildInlineDedupeKey(comment, snappedLine);
-
-    if (existingKeys.has(key)) {
-      console.error(`[DiffGuard] Skipping duplicate inline comment: ${key}`);
-      continue;
+    // INTEGRITY CHECK: every remaining inline item must satisfy validateGitLabPosition.
+    const invalidInline = fanoutQueue.filter(
+      item =>
+        item.type === 'inline' &&
+        item.position !== undefined &&
+        !validateGitLabPosition(item.position, positionMap),
+    );
+    if (invalidInline.length > 0) {
+      for (const item of invalidInline) {
+        console.error(
+          `[Position][INTEGRITY FAIL] inline item still invalid after repair — ` +
+          `forcing global: file=${item.comment.file} line=${item.position!.new_line}`,
+        );
+        item.type = 'global';
+        item.position = undefined;
+      }
     }
+  }
 
-    const body = `${formatInlineBody(comment, snappedLine)}\n[DiffGuardKey:${key}]`;
+  // ---------------------------------------------------------
+  // STEP 2: LOG SPLIT SUMMARY
+  // ---------------------------------------------------------
+  const inlineCount    = fanoutQueue.filter(i => i.type === 'inline'  && i.status !== 'skipped_duplicate').length;
+  const globalCount    = fanoutQueue.filter(i => i.type === 'global'  && i.status !== 'skipped_duplicate').length;
+  const skippedCount   = fanoutQueue.filter(i => i.status === 'skipped_duplicate').length;
+  const failedPosCount = fanoutQueue.filter(i => i.status === 'failed_position').length;
 
-    try {
+  console.error(
+    `[DiffGuard][FANOUT] queue: ${fanoutQueue.length} items | ` +
+    `inline=${inlineCount} global=${globalCount} ` +
+    `skipped_duplicate=${skippedCount} failed_position=${failedPosCount}`,
+  );
+
+  // ---------------------------------------------------------
+  // STEP 3: FAN-OUT POSTING LOOP — 1 item = 1 GitLab request, no merging
+  // ---------------------------------------------------------
+  let postedCount = 0;
+
+  const postItem = async (item: FanOutItem): Promise<void> => {
+    const body = `${formatInlineBody(item.comment, item.snappedLine ?? -1)}\n[DiffGuardKey:${item.dedupeKey}]`;
+
+    if (item.type === 'inline' && item.position !== undefined) {
       await axios.post(
         `${projectPath}/discussions`,
-        { body, position },
-        { headers: { 'PRIVATE-TOKEN': config.token } },
+        { body, position: item.position },
+        { headers: { 'PRIVATE-TOKEN': config.token }, timeout: AXIOS_TIMEOUT_MS },
       );
-      existingKeys.add(key);
-      await sleep(150);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(
-        `[DiffGuard] Warning: failed to post inline comment for ${comment.file}:${comment.lineHint}: ${message}`,
+    } else {
+      await axios.post(
+        `${projectPath}/discussions`,
+        { body },
+        { headers: { 'PRIVATE-TOKEN': config.token }, timeout: AXIOS_TIMEOUT_MS },
       );
-      fallback.push(comment);
     }
-  }
+  };
 
-  if (fallback.length === 0) return;
+  for (const item of fanoutQueue) {
+    if (item.status === 'skipped_duplicate') {
+      console.error(`[DiffGuard][FANOUT] SKIP duplicate dedupeKey=${item.dedupeKey}`);
+      continue;
+    }
 
-  // Fallback summary note with cross-run dedupe
-  const hash = buildFallbackHash(fallback);
-  const existingHashes = existingState?.noteHashes ?? new Set<string>();
-
-  if (existingHashes.has(hash)) {
-    console.error(`[DiffGuard] Skipping duplicate fallback summary note (hash: ${hash})`);
-    return;
-  }
-
-  const noteBody = truncateBody(buildFallbackNoteBody(fallback, result.summary, hash));
-
-  try {
-    await axios.post(
-      `${projectPath}/notes`,
-      { body: noteBody },
-      { headers: { 'PRIVATE-TOKEN': config.token } },
+    console.error(
+      `[GitLab][POST] file=${item.comment.file} type=${item.type} status=${item.status} dedupeKey=${item.dedupeKey}`,
     );
-  } catch (err: unknown) {
-    if (axios.isAxiosError(err) && (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT')) {
-      throw new Error('GitLab request timeout');
+
+    try {
+      await postItem(item);
+      item.status = 'posted';
+      existingKeys.add(item.dedupeKey);
+      postedCount++;
+      console.error(`[DiffGuard][POST OK] file=${item.comment.file} type=${item.type}`);
+      await sleep(POST_RATE_LIMIT_DELAY_MS);
+    } catch (err) {
+      console.error('[DiffGuard][POST FAILED]', err instanceof Error ? err.message : String(err));
+
+      if (isRetryable(err)) {
+        await sleep(500);
+        console.error(
+          `[DiffGuard][RETRY] file=${item.comment.file} type=${item.type} dedupeKey=${item.dedupeKey}`,
+        );
+        try {
+          await postItem(item);
+          item.status = 'posted';
+          existingKeys.add(item.dedupeKey);
+          postedCount++;
+          console.error(`[DiffGuard][POST OK] file=${item.comment.file} type=${item.type} (retry)`);
+          await sleep(1000);
+        } catch (retryErr) {
+          console.error(
+            '[DiffGuard][POST FAILED]',
+            retryErr instanceof Error ? retryErr.message : String(retryErr),
+          );
+        }
+      }
     }
-    const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`GitLab API error: ${message}`);
   }
+
+  console.error(
+    `[DiffGuard][FANOUT] complete: posted=${postedCount} skipped=${skippedCount} total=${totalComments}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +506,7 @@ type GitLabDiffEntry = {
  * MR mode only — never touches local git state.
  */
 export async function getMergeRequestFileContexts(config: GitLabConfig): Promise<MRDiffResult> {
+  validateGitLabBaseUrl(config);
   const apiBase = `${config.baseUrl}/api/v4`;
   const positionMap: MRPositionMap = new Map();
   const fileContexts: FileContext[] = [];
@@ -429,6 +514,7 @@ export async function getMergeRequestFileContexts(config: GitLabConfig): Promise
   const url = `${apiBase}/projects/${encodeURIComponent(config.projectId)}/merge_requests/${config.mrIid}/changes`;
   const response = await axios.get<{ changes: GitLabDiffEntry[] }>(url, {
     headers: { 'PRIVATE-TOKEN': config.token },
+    timeout: AXIOS_TIMEOUT_MS,
   });
   const allEntries: GitLabDiffEntry[] = response.data.changes ?? [];
 
@@ -469,8 +555,10 @@ export async function getMergeRequestFileContexts(config: GitLabConfig): Promise
         // Reset both counters per hunk (symmetric) — prevents drift in renamed/moved hunks
         const m = /@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
         if (m) {
-          oldLineNum = parseInt(m[1], 10);
-          newLineNum = parseInt(m[2], 10);
+          const parsedOld = parseInt(m[1], 10);
+          const parsedNew = parseInt(m[2], 10);
+          if (!isNaN(parsedOld)) oldLineNum = parsedOld;
+          if (!isNaN(parsedNew)) newLineNum = parsedNew;
         }
         continue;
       }
@@ -521,3 +609,169 @@ export async function getMergeRequestFileContexts(config: GitLabConfig): Promise
   return { fileContexts, positionMap };
 }
 
+// ---------------------------------------------------------------------------
+// extractLineFromDiff — find new_line for a search pattern in a unified diff
+// ---------------------------------------------------------------------------
+
+/**
+ * Scans a unified diff string for the first added (`+`) or context (` `) line
+ * that contains `searchPattern` and returns its new-file line number (1-based).
+ *
+ * Returns -1 when:
+ *   - `searchPattern` is empty or `diff` is empty.
+ *   - The pattern is not found in any reachable `+` or context line.
+ *
+ * Deleted lines (`-`) are intentionally excluded because they do not exist in
+ * the new file and therefore cannot be targeted by a GitLab inline position.
+ */
+export function extractLineFromDiff(diff: string, searchPattern: string): number {
+  if (!diff || !searchPattern) return -1;
+
+  let newLineNum = 0;
+
+  for (const raw of diff.split('\n')) {
+    // Hunk header — resets the new-file line counter for each hunk.
+    if (raw.startsWith('@@')) {
+      const m = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+      // Start at (newStart - 1): the counter is incremented before the line is
+      // examined, so this correctly yields newStart on the first line of the hunk.
+      if (m) {
+        const parsed = parseInt(m[1], 10);
+        if (!isNaN(parsed)) newLineNum = parsed - 1;
+      }
+      continue;
+    }
+
+    // Skip unified diff meta-headers (present in some GitLab API responses).
+    if (
+      raw.startsWith('+++') ||
+      raw.startsWith('---') ||
+      raw.startsWith('diff ') ||
+      raw.startsWith('index ')
+    ) {
+      continue;
+    }
+
+    if (raw.startsWith('+')) {
+      newLineNum++;
+      if (raw.slice(1).includes(searchPattern)) return newLineNum;
+    } else if (raw.startsWith('-')) {
+      // Deleted lines do not advance the new-file counter.
+    } else if (raw.startsWith(' ')) {
+      newLineNum++;
+      if (raw.slice(1).includes(searchPattern)) return newLineNum;
+    }
+  }
+
+  return -1;
+}
+
+// ---------------------------------------------------------------------------
+// postInlineMRComment — post a single positioned discussion on a GitLab MR
+// ---------------------------------------------------------------------------
+
+/**
+ * Posts a single inline (line-level) GitLab MR discussion using the
+ * Discussions API (`POST /projects/:id/merge_requests/:iid/discussions`).
+ *
+ * Never uses /notes or /diffs endpoints.
+ *
+ * Line resolution:
+ *   1. Snap issue.lineHint to the nearest changed line via provider.
+ *   2. No position resolved → file-level discussion (discussions API, no position).
+ */
+export async function postInlineMRComment(
+  config: GitLabConfig,
+  issue: InlineMRIssue,
+  provider: ResolvedPositionProvider,
+  version: GitLabMRVersion,
+): Promise<void> {
+  validateGitLabBaseUrl(config);
+
+  const { base_sha, start_sha, head_sha } = version;
+
+  // ─────────────────────────────────────────────
+  // STEP 1: resolve position ONLY via provider
+  // ─────────────────────────────────────────────
+  const positioned = provider.resolve(
+    {
+      file: issue.filePath,
+      lineHint: issue.lineHint ?? null,
+      violatingStatement: '',
+      message: issue.message,
+      executionPath: '',
+      suggestion: '',
+      severity: 'low',
+      ruleId: issue.ruleId,
+    },
+    { version },
+  );
+
+  console.error('[DiffGuard][INLINE][RESOLVE]', {
+    file: issue.filePath,
+    lineHint: issue.lineHint,
+    hasPosition: !!positioned,
+  });
+
+  const apiBase = `${config.baseUrl}/api/v4`;
+  const discussionsUrl =
+    `${apiBase}/projects/${encodeURIComponent(config.projectId)}` +
+    `/merge_requests/${config.mrIid}/discussions`;
+
+  // ─────────────────────────────────────────────
+  // STEP 2: INLINE COMMENT (only if valid)
+  // ─────────────────────────────────────────────
+  if (positioned?.position) {
+    const { position } = positioned;
+
+    const payload = {
+      body: issue.message,
+      position: {
+        position_type: 'text',
+        base_sha,
+        start_sha,
+        head_sha,
+        new_path: position.new_path,
+        new_line: position.new_line,
+      },
+    };
+
+    console.error(
+      '[DiffGuard][INLINE][POST]',
+      JSON.stringify(payload, null, 2),
+    );
+
+    try {
+      await axios.post(discussionsUrl, payload, {
+        headers: { 'PRIVATE-TOKEN': config.token },
+        timeout: AXIOS_TIMEOUT_MS,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`[DiffGuard] Failed to post inline MR comment: ${msg}`);
+    }
+
+    return;
+  }
+
+  // ─────────────────────────────────────────────
+  // STEP 3: GLOBAL COMMENT (no position)
+  // ─────────────────────────────────────────────
+  console.error('[DiffGuard][GLOBAL]', {
+    file: issue.filePath,
+    reason: 'no inline position → posting global MR comment',
+  });
+
+  const body = `**File: ${issue.filePath}**\n\n${issue.message}`;
+
+  try {
+    await axios.post(
+      discussionsUrl,
+      { body },
+      { headers: { 'PRIVATE-TOKEN': config.token }, timeout: AXIOS_TIMEOUT_MS },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`[DiffGuard] Failed to post global MR comment: ${msg}`);
+  }
+}

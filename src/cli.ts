@@ -7,17 +7,19 @@ import {
   FileContext,
   GitLabConfig,
   GitLabMRVersion,
+  MRPositionMap,
   ResolvedPositionProvider,
+  Rule,
 } from './types.js';
 import { loadConfig, loadGitLabConfig } from './config.js';
 import { loadRules } from './rules.js';
 import { initRuleAudit, updateAuditAfterEval } from './audit.js';
 import * as git from './git.js';
-import { evaluateWithAI } from './ai.js';
-import { renderConsoleAIResult, renderJSONAIResult } from './output.js';
+import { evaluateFileWithAI, aggregateResults } from './ai.js';
+import { runConcurrent, ConcurrentTask } from './queue.js';
+import { renderConsoleAIResult, renderJSONAIResult, renderFanoutStrictJSON } from './output.js';
 import {
   fetchExistingDiscussionKeys,
-  fetchExistingNoteHashes,
   fetchMRVersion,
   getMergeRequestFileContexts,
   LocalPositionProvider,
@@ -29,7 +31,10 @@ async function main() {
   const argv = minimist(process.argv.slice(2));
 
   // Flags
-  const outputMode: 'console' | 'json' = argv['output'] === 'json' ? 'json' : 'console';
+  const outputMode: 'console' | 'json' | 'fanout-strict' =
+    argv['output'] === 'json' ? 'json' :
+    argv['output'] === 'fanout-strict' ? 'fanout-strict' :
+    'console';
   const dryRun = !!argv['dry-run'];
   const gitlabEnabled = !!argv['gitlab'];
 
@@ -42,7 +47,7 @@ async function main() {
       ? argv['rules-path']
       : path.join(process.cwd(), 'review-guidelines', 'rules.yaml');
 
-  let rules;
+  let rules: Rule[] = [];
   try {
     rules = loadRules(rulesPath);
     console.error(`[DiffGuard] Loaded ${rules.length} rules from ${rulesPath}`);
@@ -69,6 +74,7 @@ async function main() {
   let gitlabConfig: GitLabConfig | null = null;
   let positionProvider: ResolvedPositionProvider | null = null;
   let mrVersion: GitLabMRVersion | null = null;
+  let mrPositionMap: MRPositionMap | null = null;
 
   // Extract diff and build file contexts
   let diffResult = '';
@@ -98,6 +104,7 @@ async function main() {
         mrVersion = await fetchMRVersion(gitlabConfig!);
         const mrResult = await getMergeRequestFileContexts(gitlabConfig!);
         fileContexts = mrResult.fileContexts;
+        mrPositionMap = mrResult.positionMap;
         positionProvider = new MRPositionProvider(mrResult.positionMap);
         break;
       }
@@ -110,7 +117,9 @@ async function main() {
       if (!diffResult.trim()) {
         console.error('[DiffGuard] No diff found. Nothing to review.');
         const lgtm: AIReviewResult = { summary: 'LGTM', comments: [] };
-        outputMode === 'json' ? renderJSONAIResult(lgtm) : renderConsoleAIResult(lgtm);
+        if (outputMode === 'json') renderJSONAIResult(lgtm);
+        else if (outputMode === 'fanout-strict') renderFanoutStrictJSON(lgtm);
+        else renderConsoleAIResult(lgtm);
         return;
       }
 
@@ -128,20 +137,84 @@ async function main() {
     positionProvider = new LocalPositionProvider(fileContexts);
   }
 
+  // Guard: no reviewable files found (e.g. all binary/too_large in MR mode, or empty staged diff)
+  if (fileContexts.length === 0) {
+    console.error('[DiffGuard] No reviewable file contexts found. Nothing to review.');
+    const lgtm: AIReviewResult = { summary: 'LGTM', comments: [] };
+    if (outputMode === 'json') renderJSONAIResult(lgtm);
+    else if (outputMode === 'fanout-strict') renderFanoutStrictJSON(lgtm);
+    else renderConsoleAIResult(lgtm);
+    return;
+  }
+
   // Dry-run: skip AI call, confirm wiring is correct
   if (dryRun) {
     console.error('[DiffGuard] Dry-run mode — skipping AI call.');
     const dryResult: AIReviewResult = { summary: 'LGTM [dry-run]', comments: [] };
-    outputMode === 'json' ? renderJSONAIResult(dryResult) : renderConsoleAIResult(dryResult);
+    if (outputMode === 'json') renderJSONAIResult(dryResult);
+    else if (outputMode === 'fanout-strict') renderFanoutStrictJSON(dryResult);
+    else renderConsoleAIResult(dryResult);
     return;
   }
 
-  // AI evaluation
-  const result = await evaluateWithAI(fileContexts, rules, config!);
+  // AI evaluation — per-file chunked pipeline
+  // Each file is split into size-limited chunks; chunks for the same file are
+  // processed sequentially. Up to config.maxConcurrency files run in parallel.
+
+  // Build per-file chunk groups (mandatory chunking, both local and MR mode)
+  type ChunkEntry = { ctx: FileContext; label: string };
+  type FileGroup = { file: string; chunks: ChunkEntry[] };
+
+  const fileGroups: FileGroup[] = fileContexts.map(ctx => {
+    const chunks = git.chunkFileContexts(ctx, config!.chunkSize, 48_000);
+    const n = chunks.length;
+    return {
+      file: ctx.file,
+      chunks: chunks.map((chunk, i) => ({
+        ctx: chunk,
+        label: n > 1 ? `${ctx.file} [chunk ${i + 1}/${n}]` : ctx.file,
+      })),
+    };
+  });
+
+  const totalChunks = fileGroups.reduce((sum, g) => sum + g.chunks.length, 0);
+  console.error(
+    `[DiffGuard] Processing ${totalChunks} chunk(s) across ${fileContexts.length} file(s) ` +
+    `(maxConcurrency=${config!.maxConcurrency})`,
+  );
+
+  // One queue task per FILE — chunks within a file run sequentially.
+  // The queue runs up to maxConcurrency files concurrently.
+  const tasks: ConcurrentTask<AIReviewResult[]>[] = fileGroups.map(group => ({
+    label: group.file,
+    run: async (): Promise<AIReviewResult[]> => {
+      const fileResults: AIReviewResult[] = [];
+      for (const { ctx, label } of group.chunks) {
+        const r = await evaluateFileWithAI(ctx, rules, config!, label);
+        fileResults.push(r);
+      }
+      return fileResults;
+    },
+  }));
+
+  const rawResults = await runConcurrent(tasks, config!.maxConcurrency);
+
+  const failedFiles = rawResults.filter(r => r === null).length;
+  if (failedFiles > 0) {
+    console.error(`[DiffGuard] Warning: ${failedFiles} file(s) failed and were skipped.`);
+  }
+
+  const successfulResults = rawResults
+    .filter((r): r is AIReviewResult[] => r !== null)
+    .flat();
+
+  const result = aggregateResults(successfulResults);
   updateAuditAfterEval(auditTable, result);
 
   if (outputMode === 'json') {
     renderJSONAIResult(result);
+  } else if (outputMode === 'fanout-strict') {
+    renderFanoutStrictJSON(result);
   } else {
     renderConsoleAIResult(result);
   }
@@ -157,7 +230,7 @@ async function main() {
       const version = mode === 'mr' ? mrVersion! : await fetchMRVersion(resolvedConfig);
       const existingState = mode === 'mr' ? {
         discussionKeys: await fetchExistingDiscussionKeys(resolvedConfig),
-        noteHashes: await fetchExistingNoteHashes(resolvedConfig),
+        positionMap: mrPositionMap ?? undefined,
       } : undefined;
       await postGitLabMR(result, resolvedConfig, positionProvider!, version, existingState);
     } catch (err: unknown) {
