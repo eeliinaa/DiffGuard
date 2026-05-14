@@ -6,7 +6,7 @@
   "main": "dist/cli.js",
   "types": "dist/cli.d.ts",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/cli.js",
     "lint": "eslint src --ext .ts",
     "test": "echo \"No tests yet\""
